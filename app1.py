@@ -90,7 +90,7 @@ col_left, col_center, col_right = st.columns([1, 3, 3])
 
 # ✅ Left Column: Inputs & Buttons
 with col_left:
-    github_token = st.text_input("GitHub Token", type="password", value="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")
+    github_token = st.text_input("GitHub Token", type="password")
     owner = st.text_input("Repository Owner", value="etn-utilities")
     repo = st.text_input("Repository Name", value="yuk-yukon")
     stale_days = st.number_input("Stale Branch Threshold (days)", min_value=1, value=90)
@@ -152,4 +152,5 @@ status_placeholder.success(f"✅ Completed fetching! Total branches: {len(branch
 if not fetching_flag.is_set() and branch_details:
     st.session_state.fetching = False
     with col_left:
+
         status_placeholder.success(f"✅ Completed fetching! Total branches: {len(branch_details)}")
