@@ -1,0 +1,4 @@
+httpx==0.28.1
+streamlit==1.40.2
+matplotlib==3.9.3
+pandas==2.2.3
