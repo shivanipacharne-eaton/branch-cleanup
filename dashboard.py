@@ -24,6 +24,12 @@ if "branch_details" not in st.session_state:
     st.session_state.branch_details = []
 if "branch_categories" not in st.session_state:
     st.session_state.branch_categories = {"stale": [], "open_pr": [], "closed_pr": [], "no_pr": []}
+if "delete_stale" not in st.session_state:
+    st.session_state.delete_stale = False
+if "delete_closed_pr" not in st.session_state:
+    st.session_state.delete_closed_pr = False
+if "delete_no_pr" not in st.session_state:
+    st.session_state.delete_no_pr = False
 
 # Shared data - use session state to persist across reruns
 branch_details = st.session_state.branch_details
@@ -123,7 +129,7 @@ def fetch_branches_continuously(token, owner, repo, stale_days):
 
     page = 1
     while fetching_flag.is_set():
-        url = f"{branches_url}?per_page=10&page={page}"
+        url = f"{branches_url}?per_page=5&page={page}"
         logging.info(f"Fetching page {page} from GitHub API...")
         
         try:
@@ -228,7 +234,7 @@ if stop_btn and st.session_state.fetching:
     status_placeholder.empty()
     st.warning("Fetching stopped by user.")
 
-if not st.session_state.fetching:
+if not st.session_state.fetching and not st.session_state.branches_to_delete:
     status_placeholder.info("Idle. Click 'Start Fetching Branches' to begin.")
 
 # =============================
@@ -271,41 +277,138 @@ while st.session_state.fetching or fetching_flag.is_set():
 # =============================
 logging.info(f"Checking delete section: fetching={st.session_state.fetching}, branch_details count={len(branch_details)}")
 
+delete_btn = None
+
 if not st.session_state.fetching and branch_details:
     with lock:
         active_branches = [b for b in branch_details if b["Branch"] not in st.session_state.deleted_branches]
         stale_branches = [b for b in active_branches if b["Category"] == "stale"]
+        closed_pr_branches = [b for b in active_branches if b["Category"] == "closed_pr"]
+        no_pr_branches = [b for b in active_branches if b["Category"] == "no_pr"]
         
-        # Filter out protected branches
+        # Filter out protected branches from all categories
+        protected_branches = ['main', 'master', 'develop', 'development']
         deletable_stale = [b for b in stale_branches 
-                          if b["Branch"].lower() not in ['main', 'master', 'develop', 'development']]
+                          if b["Branch"].lower() not in protected_branches]
+        deletable_closed_pr = [b for b in closed_pr_branches 
+                              if b["Branch"].lower() not in protected_branches]
+        deletable_no_pr = [b for b in no_pr_branches 
+                          if b["Branch"].lower() not in protected_branches]
+        
+        # Update graph with current counts (active branches only)
+        active_counts = {
+            'stale': len(deletable_stale),
+            'open_pr': len([b for b in active_branches if b["Category"] == "open_pr"]),
+            'closed_pr': len(deletable_closed_pr),
+            'no_pr': len(deletable_no_pr)
+        }
+        fig, ax = plt.subplots(figsize=(6, 4))
+        bars = ax.bar(active_counts.keys(), active_counts.values(), color=['orange', 'green', 'blue', 'gray'])
+        ax.set_title("Live Branch Category Summary")
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{int(height)}',
+                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+        graph_placeholder.pyplot(fig)
+        plt.close(fig)
+        
+        # Update table
+        df = pd.DataFrame(active_branches)
+        table_placeholder.dataframe(df, height=550)
     
-    logging.info(f"Found {len(deletable_stale)} deletable stale branches")
+    logging.info(f"Found {len(deletable_stale)} deletable stale branches, {len(deletable_closed_pr)} closed PR branches, {len(deletable_no_pr)} no PR branches")
     
-    # Show delete button in left column
+    # Build radio options based on available branches
+    delete_options = []
     if deletable_stale:
+        delete_options.append(f"Stale Branches ({len(deletable_stale)})")
+    if deletable_closed_pr:
+        delete_options.append(f"Closed PR Branches ({len(deletable_closed_pr)})")
+    if deletable_no_pr:
+        delete_options.append(f"No PR Branches ({len(deletable_no_pr)})")
+    
+    # Show delete options in left column
+    if delete_options:
         with delete_button_placeholder.container():
             st.markdown("---")
-            st.markdown(f"**{len(deletable_stale)} Stale Branches**")
-            delete_btn = st.button(f"🗑️ Delete All Stale", 
-                       type="primary", 
-                       use_container_width=True,
-                       key="delete_all_stale")
+            st.markdown("### Delete Options")
+            st.markdown("Select branch categories to delete:")
+            
+            # Show checkboxes for available categories
+            if deletable_stale:
+                st.session_state.delete_stale = st.checkbox(
+                    f"Stale Branches ({len(deletable_stale)})",
+                    key="checkbox_stale"
+                )
+            
+            if deletable_closed_pr:
+                st.session_state.delete_closed_pr = st.checkbox(
+                    f"Closed PR Branches ({len(deletable_closed_pr)})",
+                    key="checkbox_closed_pr"
+                )
+            
+            if deletable_no_pr:
+                st.session_state.delete_no_pr = st.checkbox(
+                    f"No PR Branches ({len(deletable_no_pr)})",
+                    key="checkbox_no_pr"
+                )
+            
+            delete_btn = st.button(
+                "🗑️ Delete Selected Categories", 
+                type="primary", 
+                use_container_width=True,
+                key="delete_branches_btn"
+            )
         
+# Handle delete button click
 if delete_btn:
-    # Add branches to delete queue and trigger rerun
-    logging.info(f"🔴 BUTTON CLICKED! User clicked 'Delete All Stale' button - queuing {len(deletable_stale)} branches")
-    print(f"\n🔴 BUTTON CLICKED! Queuing {len(deletable_stale)} branches for deletion")
-    for branch in deletable_stale:
-        st.session_state.branches_to_delete.add(branch["Branch"])
-        logging.debug(f"Queued for deletion: {branch['Branch']}")
-    logging.info(f"Total branches queued for deletion: {len(st.session_state.branches_to_delete)}")
+    # Determine which branches to delete based on checkbox selections
+    branches_to_queue = []
+    selected_categories = []
+    
+    if st.session_state.delete_stale:
+        branches_to_queue.extend(deletable_stale)
+        selected_categories.append(f"Stale ({len(deletable_stale)})")
+        logging.info(f"🔴 User selected 'Stale Branches' - queuing {len(deletable_stale)} branches")
+        print(f"\n🔴 Queuing {len(deletable_stale)} stale branches for deletion")
+    
+    if st.session_state.delete_closed_pr:
+        branches_to_queue.extend(deletable_closed_pr)
+        selected_categories.append(f"Closed PR ({len(deletable_closed_pr)})")
+        logging.info(f"🔴 User selected 'Closed PR Branches' - queuing {len(deletable_closed_pr)} branches")
+        print(f"\n🔴 Queuing {len(deletable_closed_pr)} closed PR branches for deletion")
+    
+    if st.session_state.delete_no_pr:
+        branches_to_queue.extend(deletable_no_pr)
+        selected_categories.append(f"No PR ({len(deletable_no_pr)})")
+        logging.info(f"🔴 User selected 'No PR Branches' - queuing {len(deletable_no_pr)} branches")
+        print(f"\n🔴 Queuing {len(deletable_no_pr)} no PR branches for deletion")
+    
+    if branches_to_queue:
+        logging.info(f"🔴 BUTTON CLICKED! Deleting categories: {', '.join(selected_categories)}")
+        # Queue branches for deletion
+        for branch in branches_to_queue:
+            st.session_state.branches_to_delete.add(branch["Branch"])
+            logging.debug(f"Queued for deletion: {branch['Branch']}")
+        logging.info(f"Total branches queued for deletion: {len(st.session_state.branches_to_delete)}")
+        
+        # Reset checkboxes after queuing
+        st.session_state.delete_stale = False
+        st.session_state.delete_closed_pr = False
+        st.session_state.delete_no_pr = False
+    else:
+        st.warning("Please select at least one category to delete.")
 
 # =============================
 # Handle branch deletion (runs on every rerun if queue is not empty)
 # =============================
 if st.session_state.branches_to_delete and not st.session_state.fetching:
     branches_list = list(st.session_state.branches_to_delete)
+    
+    # Update status message
+    status_placeholder.warning(f"🗑️ Deleting {len(branches_list)} branches...")
     
     # Print list of branches to be deleted
     print(f"\n{'='*60}")
@@ -321,28 +424,7 @@ if st.session_state.branches_to_delete and not st.session_state.fetching:
         deleted, failed = delete_branches(github_token, owner, repo, branches_list)
         st.session_state.branches_to_delete.clear()
     
-    # Update graph and table after all deletions
-    with lock:
-        counts = {cat: len(branch_list) for cat, branch_list in branch_categories.items()}
-        fig, ax = plt.subplots(figsize=(6, 4))
-        bars = ax.bar(counts.keys(), counts.values(), color=['orange', 'green', 'blue', 'gray'])
-        ax.set_title("Live Branch Category Summary")
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{int(height)}',
-                       ha='center', va='bottom', fontsize=10, fontweight='bold')
-        graph_placeholder.pyplot(fig)
-        plt.close(fig)
-        
-        active_branches = [b for b in branch_details if b["Branch"] not in st.session_state.deleted_branches]
-        df = pd.DataFrame(active_branches)
-        table_placeholder.dataframe(df, height=550)
-    
+    status_placeholder.success(f"✅ Deleted {deleted} branches, {failed} failed")
     st.success(f"✅ Deleted {deleted} branches, {failed} failed")
     time.sleep(1)
-    st.session_state.fetching = True
-    fetching_flag.set()
-    fetch_completed.clear()
     st.rerun()
