@@ -6,6 +6,10 @@ import threading
 import time
 import pandas as pd
 import logging
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from collections import defaultdict
 
 # ✅ Enable wide layout
 st.set_page_config(layout="wide")
@@ -63,7 +67,7 @@ def delete_branches(token, owner, repo, branches_list):
     for branch_name in branches_list:
         delete_url = f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch_name}"
         try:
-            response = client.delete(delete_url, headers=headers)
+            response = "" #client.delete(delete_url, headers=headers)
             if response.status_code == 204:
                 deleted_count += 1
                 logging.info(f"✅ Deleted ({deleted_count}/{len(branches_list)}): {branch_name}")
@@ -97,6 +101,111 @@ def delete_branches(token, owner, repo, branches_list):
     status_placeholder.success(f"✅ Deleted {deleted_count} branches, {failed_count} failed")
     
     return deleted_count, failed_count
+
+# =============================
+# Notification Functions
+# =============================
+def generate_notification_summary(branches_by_author):
+    """Generate a summary text for notifications"""
+    summary = "🔔 GitHub Stale Branch Notification\n\n"
+    summary += "The following branches have been identified as stale and may need attention:\n\n"
+    
+    for author_email, branches in sorted(branches_by_author.items()):
+        author_name = branches[0]['author_name']
+        summary += f"📧 {author_name} ({author_email}):\n"
+        for branch in branches:
+            summary += f"  - {branch['branch_name']} (last commit: {branch['last_commit']})\n"
+        summary += "\n"
+    
+    return summary
+
+def send_email_notification(smtp_server, smtp_port, sender_email, sender_password, recipient_email, subject, body):
+    """Send email notification"""
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'plain'))
+        
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+        
+        return True, "Email sent successfully"
+    except Exception as e:
+        return False, str(e)
+
+def prepare_notification_data(branch_list):
+    """Group branches by author email"""
+    branches_by_author = defaultdict(list)
+    
+    for branch in branch_list:
+        branches_by_author[branch['Author Email']].append({
+            'author_name': branch['Author'],
+            'branch_name': branch['Branch'],
+            'last_commit': branch['Last Commit'],
+            'category': branch['Category']
+        })
+    
+    return branches_by_author
+
+def create_github_issue_notification(token, owner, repo, branches_by_author, issue_title="Stale Branch Cleanup Notification"):
+    """Create a GitHub issue mentioning branch authors"""
+    try:
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+        client = httpx.Client(verify=False, timeout=60.0)
+        
+        # Collect all unique author names for assignment
+        assignees = []
+        for author_email, branches in branches_by_author.items():
+            author_name = branches[0]['author_name']
+            assignees.append(author_name)
+            logging.info(f"Adding assignee: {author_name} ({author_email})")
+        
+        # Build issue body
+        body = "## 🔔 Stale Branch Notification\n\n"
+        body += "The following branches have been identified as stale and may need cleanup:\n\n"
+        
+        for author_email, branches in sorted(branches_by_author.items()):
+            author_name = branches[0]['author_name']
+            body += f"### @{author_name} ({author_email})\n\n"
+            logging.info(f"Adding section for {author_name} ({author_email})")
+            
+            body += "| Branch | Last Commit | Category |\n"
+            body += "|--------|-------------|----------|\n"
+            for branch in branches:
+                body += f"| `{branch['branch_name']}` | {branch['last_commit']} | {branch['category']} |\n"
+            body += "\n"
+        
+        body += "---\n"
+        body += "_Please review these branches and delete them if they are no longer needed._\n"
+        
+        # Create the issue with assignees
+        issue_url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+        issue_data = {
+            "title": issue_title,
+            "body": body,
+            "labels": ["branch-cleanup", "stale-branches"],
+            "assignees": assignees
+        }
+        
+        logging.info(f"Creating issue with {len(assignees)} assignees: {assignees}")
+        
+        response = client.post(issue_url, headers=headers, json=issue_data)
+        client.close()
+        
+        if response.status_code == 201:
+            issue_number = response.json()['number']
+            issue_html_url = response.json()['html_url']
+            return True, f"Issue #{issue_number} created successfully with {len(assignees)} assignees", issue_html_url
+        else:
+            return False, f"Failed to create issue: {response.status_code} - {response.text}", None
+            
+    except Exception as e:
+        return False, f"Error creating issue: {str(e)}", None
 
 # =============================
 # Background Fetch Function (NO Streamlit calls)
@@ -213,6 +322,19 @@ with col_left:
     # Delete button placeholder in left column
     delete_btn = None
     delete_button_placeholder = st.empty()
+    
+    # Notification section
+    st.markdown("---")
+    st.markdown("### 📧 GitHub Notifications")
+    st.info("💡 Create a GitHub issue with @mentions to notify branch authors via GitHub's notification system")
+    
+    notify_btn = st.button(
+        "📧 Notify Branch Authors",
+        use_container_width=True,
+        key="notify_authors_btn",
+        help="Send notifications to authors about their stale branches",
+        disabled=st.session_state.fetching or len(branch_details) == 0
+    )
 
 # ✅ Center Column: Graph
 with col_center:
@@ -387,7 +509,7 @@ if not st.session_state.fetching and branch_details:
                 )
             
             delete_btn = st.button(
-                "🗑️ Delete Selected Categories", 
+                "🗱️ Delete Selected Categories", 
                 type="primary", 
                 use_container_width=True,
                 key="delete_branches_btn"
@@ -435,6 +557,56 @@ if delete_btn:
         st.session_state.delete_no_pr = False
     else:
         st.warning("Please select at least one category to delete.")
+
+# Handle notification button click
+if notify_btn:
+    logging.info(f"📧 Notification button clicked - Creating GitHub issue")
+    
+    # Collect selected branches for notification
+    branches_to_notify = []
+    
+    if st.session_state.delete_stale:
+        branches_to_notify.extend(deletable_stale)
+        logging.info(f"Selected stale branches for notification: {len(deletable_stale)}")
+    
+    if st.session_state.delete_closed_pr:
+        branches_to_notify.extend(deletable_closed_pr)
+        logging.info(f"Selected closed PR branches for notification: {len(deletable_closed_pr)}")
+    
+    if st.session_state.delete_no_pr:
+        branches_to_notify.extend(deletable_no_pr)
+        logging.info(f"Selected no PR branches for notification: {len(deletable_no_pr)}")
+    
+    if not branches_to_notify:
+        logging.warning("⚠️ No branches selected for notification")
+        st.warning("Please select at least one category to notify about.")
+    else:
+        logging.info(f"Total branches to notify about: {len(branches_to_notify)}")
+        
+        # Prepare notification data
+        branches_by_author = prepare_notification_data(branches_to_notify)
+        logging.info(f"Branches grouped by {len(branches_by_author)} authors")
+        
+        # Create GitHub issue with @mentions
+        logging.info("🔔 Creating GitHub issue with @mentions")
+        with st.spinner("Creating GitHub issue with notifications..."):
+            issue_title = f"🔔 Stale Branch Cleanup - {len(branches_to_notify)} branches need attention"
+            logging.info(f"Issue title: {issue_title}")
+            
+            success, message, issue_url = create_github_issue_notification(
+                github_token, owner, repo, branches_by_author, issue_title
+            )
+            
+            if success:
+                st.success(f"✅ {message}")
+                if issue_url:
+                    st.markdown(f"**[View Issue]({issue_url})** - Authors will be notified via GitHub")
+                    st.info("💡 Users mentioned with @username will receive GitHub notifications automatically")
+                logging.info(f"✅ GitHub issue created: {issue_url}")
+            else:
+                st.error(f"❌ {message}")
+                logging.error(f"❌ Failed to create GitHub issue: {message}")
+
 
 # =============================
 # Handle branch deletion (runs on every rerun if queue is not empty)
