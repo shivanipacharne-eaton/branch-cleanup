@@ -30,6 +30,10 @@ if "delete_closed_pr" not in st.session_state:
     st.session_state.delete_closed_pr = False
 if "delete_no_pr" not in st.session_state:
     st.session_state.delete_no_pr = False
+if "deletion_complete" not in st.session_state:
+    st.session_state.deletion_complete = False
+if "refresh_graph" not in st.session_state:
+    st.session_state.refresh_graph = False
 
 # Shared data - use session state to persist across reruns
 branch_details = st.session_state.branch_details
@@ -90,6 +94,7 @@ def delete_branches(token, owner, repo, branches_list):
     print(f"Total processed: {len(branches_list)}")
     print(f"{'='*60}\n")
     logging.info(f"Deletion complete: {deleted_count} deleted, {failed_count} failed")
+    status_placeholder.success(f"✅ Deleted {deleted_count} branches, {failed_count} failed")
     
     return deleted_count, failed_count
 
@@ -274,12 +279,8 @@ while st.session_state.fetching or fetching_flag.is_set():
     time.sleep(0.5)
 
 # =============================
-# Delete Buttons Section (after fetching completes)
+# Update graph and table after fetching completes (persist across checkbox clicks, refresh after deletion)
 # =============================
-logging.info(f"Checking delete section: fetching={st.session_state.fetching}, branch_details count={len(branch_details)}")
-
-delete_btn = None
-
 if not st.session_state.fetching and branch_details:
     with lock:
         active_branches = [b for b in branch_details if b["Branch"] not in st.session_state.deleted_branches]
@@ -296,28 +297,57 @@ if not st.session_state.fetching and branch_details:
         deletable_no_pr = [b for b in no_pr_branches 
                           if b["Branch"].lower() not in protected_branches]
         
-        # Update graph with current counts (active branches only)
-        active_counts = {
-            'stale': len(deletable_stale),
-            'open_pr': len([b for b in active_branches if b["Category"] == "open_pr"]),
-            'closed_pr': len(deletable_closed_pr),
-            'no_pr': len(deletable_no_pr)
-        }
-        fig, ax = plt.subplots(figsize=(6, 4))
-        bars = ax.bar(active_counts.keys(), active_counts.values(), color=['orange', 'green', 'blue', 'gray'])
-        ax.set_title("Live Branch Category Summary")
-        for bar in bars:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{int(height)}',
-                       ha='center', va='bottom', fontsize=10, fontweight='bold')
-        graph_placeholder.pyplot(fig)
-        plt.close(fig)
+        # Store in session state to avoid recalculation on checkbox clicks
+        st.session_state.active_branches = active_branches
+        st.session_state.deletable_stale = deletable_stale
+        st.session_state.deletable_closed_pr = deletable_closed_pr
+        st.session_state.deletable_no_pr = deletable_no_pr
+
+        logging.info(f"session_state updated: branches_to_delete={st.session_state.branches_to_delete}, deletion_complete={st.session_state.deletion_complete}, refresh_graph={st.session_state.refresh_graph}")
         
-        # Update table
-        df = pd.DataFrame(active_branches)
-        table_placeholder.dataframe(df, height=550)
+        # Only update graph when deletion is complete or refresh flag is set
+        if not st.session_state.branches_to_delete or st.session_state.deletion_complete or st.session_state.refresh_graph:
+            # Update graph with current counts (active branches only)
+            active_counts = {
+                'stale': len(deletable_stale),
+                'open_pr': len([b for b in active_branches if b["Category"] == "open_pr"]),
+                'closed_pr': len(deletable_closed_pr),
+                'no_pr': len(deletable_no_pr)
+            }
+            logging.info(f"Active counts for graph update: {active_counts}")
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            bars = ax.bar(active_counts.keys(), active_counts.values(), color=['orange', 'green', 'blue', 'gray'])
+            ax.set_title("Live Branch Category Summary")
+            for bar in bars:
+                height = bar.get_height()
+                if height > 0:
+                    ax.text(bar.get_x() + bar.get_width()/2., height,
+                           f'{int(height)}',
+                           ha='center', va='bottom', fontsize=10, fontweight='bold')
+            graph_placeholder.pyplot(fig)
+            plt.close(fig)
+            
+            # Update table
+            df = pd.DataFrame(active_branches)
+            table_placeholder.dataframe(df, height=550)
+            
+            # Reset refresh flag after updating
+            if st.session_state.refresh_graph:
+                st.session_state.refresh_graph = False
+
+# =============================
+# Delete Buttons Section (after fetching completes)
+# =============================
+logging.info(f"Checking delete section: fetching={st.session_state.fetching}, branch_details count={len(branch_details)}")
+
+delete_btn = None
+
+if not st.session_state.fetching and branch_details:
+    # Retrieve cached values from session state
+    deletable_stale = st.session_state.get("deletable_stale", [])
+    deletable_closed_pr = st.session_state.get("deletable_closed_pr", [])
+    deletable_no_pr = st.session_state.get("deletable_no_pr", [])
     
     logging.info(f"Found {len(deletable_stale)} deletable stale branches, {len(deletable_closed_pr)} closed PR branches, {len(deletable_no_pr)} no PR branches")
     
@@ -389,6 +419,10 @@ if delete_btn:
     
     if branches_to_queue:
         logging.info(f"🔴 BUTTON CLICKED! Deleting categories: {', '.join(selected_categories)}")
+        
+        # Reset deletion_complete flag when starting new deletion
+        st.session_state.deletion_complete = False
+        
         # Queue branches for deletion
         for branch in branches_to_queue:
             st.session_state.branches_to_delete.add(branch["Branch"])
@@ -426,6 +460,50 @@ if st.session_state.branches_to_delete and not st.session_state.fetching:
         st.session_state.branches_to_delete.clear()
     
     status_placeholder.success(f"✅ Deleted {deleted} branches, {failed} failed")
-    st.success(f"✅ Deleted {deleted} branches, {failed} failed")
+    
+    # Set flags and immediately update graph and table
+    st.session_state.deletion_complete = True
+    st.session_state.refresh_graph = True
+    
+    # Force immediate update of graph and table
+    with lock:
+        active_branches = [b for b in branch_details if b["Branch"] not in st.session_state.deleted_branches]
+        
+        # Filter out protected branches
+        protected_branches = ['main', 'master', 'develop', 'development']
+        stale_branches = [b for b in active_branches if b["Category"] == "stale"]
+        closed_pr_branches = [b for b in active_branches if b["Category"] == "closed_pr"]
+        no_pr_branches = [b for b in active_branches if b["Category"] == "no_pr"]
+        
+        deletable_stale = [b for b in stale_branches if b["Branch"].lower() not in protected_branches]
+        deletable_closed_pr = [b for b in closed_pr_branches if b["Branch"].lower() not in protected_branches]
+        deletable_no_pr = [b for b in no_pr_branches if b["Branch"].lower() not in protected_branches]
+        
+        # Update counts
+        active_counts = {
+            'stale': len(deletable_stale),
+            'open_pr': len([b for b in active_branches if b["Category"] == "open_pr"]),
+            'closed_pr': len(deletable_closed_pr),
+            'no_pr': len(deletable_no_pr)
+        }
+        
+        logging.info(f"Post-deletion graph update with counts: {active_counts}")
+        
+        # Update graph immediately
+        fig, ax = plt.subplots(figsize=(6, 4))
+        bars = ax.bar(active_counts.keys(), active_counts.values(), color=['orange', 'green', 'blue', 'gray'])
+        ax.set_title("Live Branch Category Summary")
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{int(height)}',
+                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+        graph_placeholder.pyplot(fig)
+        plt.close(fig)
+        
+        # Update table immediately
+        df = pd.DataFrame(active_branches)
+        table_placeholder.dataframe(df, height=550)
+
     time.sleep(1)
-    st.rerun()
