@@ -234,7 +234,8 @@ if stop_btn and st.session_state.fetching:
     status_placeholder.empty()
     st.warning("Fetching stopped by user.")
 
-if not st.session_state.fetching and not st.session_state.branches_to_delete:
+# Show idle message only if not fetching, not deleting, and no branches fetched yet
+if not st.session_state.fetching and not st.session_state.branches_to_delete and len(branch_details) == 0:
     status_placeholder.info("Idle. Click 'Start Fetching Branches' to begin.")
 
 # =============================
