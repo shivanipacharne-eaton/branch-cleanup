@@ -87,7 +87,7 @@ def delete_branches(token, owner, repo, branches_list):
     for branch_name in branches_list:
         delete_url = f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch_name}"
         try:
-            response = client.delete(delete_url, headers=headers)
+            response = "" #client.delete(delete_url, headers=headers)
             if response.status_code == 204:
                 deleted_count += 1
                 logging.info(f"✅ Deleted ({deleted_count}/{len(branches_list)}): {branch_name}")
@@ -159,40 +159,48 @@ def send_email_notification(smtp_server, smtp_port, sender_email, sender_passwor
         return False, str(e)
 
 def prepare_notification_data(branch_list):
-    """Group branches by author email"""
-    branches_by_author = defaultdict(list)
+    """Group branches by Updated By (last person who worked on the branch)"""
+    branches_by_updater = defaultdict(list)
     
     for branch in branch_list:
-        branches_by_author[branch['Author Email']].append({
-            'author_name': branch['Author'],
+        updated_by = branch.get('Updated By', 'Unknown')
+        branches_by_updater[updated_by].append({
             'branch_name': branch['Branch'],
             'last_commit': branch['Last Commit'],
-            'category': branch['Category']
+            'category': branch['Category'],
+            'updated_by': updated_by,
+            'author_email': branch.get('_author_email', 'Unknown')
         })
     
-    return branches_by_author
+    return branches_by_updater
 
-def create_github_issue_notification(token, owner, repo, branches_by_author, issue_title="Stale Branch Cleanup Notification"):
-    """Create a GitHub issue mentioning branch authors"""
+def create_github_issue_notification(token, owner, repo, branches_by_updater, issue_title="Stale Branch Cleanup Notification"):
+    """Create a GitHub issue mentioning branch updaters"""
     try:
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
         client = httpx.Client(verify=False, timeout=60.0)
+        logging.info(f"branches_by_updater for issue creation: {branches_by_updater}")
         
-        # Collect all unique author names as assignees
+        # Collect all unique updater names as assignees
         assignees = set()
-        for author_email, branches in branches_by_author.items():
-            author_name = branches[0]['author_name']
+        for updated_by, branches in branches_by_updater.items():
+            logging.info(f"Processing updated_by: {updated_by} with {len(branches)} branches")
             # Check if any branch is open_pr category
             has_open_pr = any(branch['category'] == 'open_pr' for branch in branches)
             
             if has_open_pr:
-                # Extract username from GitHub noreply email for open PR branches
-                github_username = extract_github_username(author_email)
-                assignees.add(github_username)
-                logging.info(f"Adding assignee: {github_username} (from {author_email}) - has open PR")
+                # For open PR branches, try to extract username from email if available
+                author_email = branches[0].get('author_email', '')
+                if '@users.noreply.github.com' in author_email:
+                    github_username = extract_github_username(author_email)
+                    assignees.add(github_username)
+                    logging.info(f"Adding assignee: {github_username} (from {author_email}) - has open PR")
+                else:
+                    assignees.add(updated_by)
+                    logging.info(f"Adding assignee: {updated_by} - has open PR")
             else:
-                assignees.add(author_name)
-                logging.info(f"Adding assignee: {author_name} ({author_email})")
+                assignees.add(updated_by)
+                logging.info(f"Adding assignee: {updated_by}")
         
         # Convert set to list for API
         assignees = list(assignees)
@@ -201,35 +209,14 @@ def create_github_issue_notification(token, owner, repo, branches_by_author, iss
         body = "## 🔔 Stale Branch Notification\n\n"
         body += "The following branches have been identified as stale and may need cleanup:\n\n"
         
-        # Group branches by username (extracted from email for open_pr)
-        branches_by_username = {}
-        for author_email, branches in branches_by_author.items():
-            author_name = branches[0]['author_name']
-            has_open_pr = any(branch['category'] == 'open_pr' for branch in branches)
-            
-            if has_open_pr:
-                username = extract_github_username(author_email)
-            else:
-                username = author_name
-            
-            # Consolidate branches under the same username
-            if username not in branches_by_username:
-                branches_by_username[username] = {
-                    'emails': set(),
-                    'branches': []
-                }
-            branches_by_username[username]['emails'].add(author_email)
-            branches_by_username[username]['branches'].extend(branches)
-        
-        # Generate issue body with consolidated tables
-        for username, data in sorted(branches_by_username.items()):
-            emails_str = ', '.join(sorted(data['emails']))
-            body += f"### @{username} ({emails_str})\n\n"
-            logging.info(f"Adding section for @{username} with {len(data['branches'])} branches")
+        # Generate issue body grouped by updater
+        for updated_by, branches in sorted(branches_by_updater.items()):
+            body += f"### @{updated_by}\n\n"
+            logging.info(f"Adding section for @{updated_by} with {len(branches)} branches")
             
             body += "| Branch | Last Commit | Category |\n"
             body += "|--------|-------------|----------|\n"
-            for branch in data['branches']:
+            for branch in branches:
                 body += f"| `{branch['branch_name']}` | {branch['last_commit']} | {branch['category']} |\n"
             body += "\n"
         
@@ -324,14 +311,57 @@ def fetch_branches_continuously(token, owner, repo, stale_days):
                 name = branch['name']
                 commit_url = branch['commit']['url']
                 try:
+                    # Get latest commit data for last commit date
                     commit_data = client.get(commit_url, headers=headers).json()
                     commit_date_str = commit_data['commit']['author']['date']
+                    commit_date = datetime.strptime(commit_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                    
+                    # Try to get branch creator from events API
+                    events_url = f"https://api.github.com/repos/{owner}/{repo}/events"
+                    try:
+                        events_response = client.get(events_url, headers=headers)
+                        author_name = None
+                        author_email = None
+                        
+                        if events_response.status_code == 200:
+                            events = events_response.json()
+                            # Look for CreateEvent for this branch
+                            for event in events:
+                                if (event.get('type') == 'CreateEvent' and 
+                                    event.get('payload', {}).get('ref') == name and
+                                    event.get('payload', {}).get('ref_type') == 'branch'):
+                                    actor_login = event.get('actor', {}).get('login', 'Unknown')
+                                    author_name = actor_login
+                                    # Use commit email (which is the actual email associated with commits)
+                                    author_email = commit_data['commit']['author'].get('email', 'Unknown')
+                                    break
+                        
+                        # If not found in events, fallback to commit author
+                        if not author_name:
+                            if commit_data.get('author') and commit_data['author'].get('login'):
+                                author_name = commit_data['author']['login']
+                            elif commit_data.get('committer') and commit_data['committer'].get('login'):
+                                author_name = commit_data['committer']['login']
+                            else:
+                                author_name = commit_data['commit']['author'].get('name', 'Unknown')
+                            author_email = commit_data['commit']['author'].get('email', 'Unknown')
+                            
+                    except Exception as e:
+                        logging.warning(f"Could not fetch events for branch {name}: {e}, using commit author")
+                        # Fallback to commit author
+                        if commit_data.get('author') and commit_data['author'].get('login'):
+                            author_name = commit_data['author']['login']
+                        else:
+                            author_name = commit_data['commit']['author'].get('name', 'Unknown')
+                        author_email = commit_data['commit']['author'].get('email', 'Unknown')
+                    
+                    # Updated By is the same as Author (branch creator) for consistency with GitHub
+                    # GitHub's "Updated" shows who created/pushed the branch, not the commit author
+                    updated_by = author_name if author_name else 'Unknown'
+                    
                 except Exception as e:
                     logging.error(f"Failed to fetch commit for branch {name}: {e}")
                     continue
-                commit_date = datetime.strptime(commit_date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-                author_name = commit_data['commit']['author'].get('name', 'Unknown')
-                author_email = commit_data['commit']['author'].get('email', 'Unknown')
 
                 category = "stale" if (now - commit_date).days > stale_days else pr_map.get(name, "no_pr")
                 branch_categories[category].append((author_name, author_email, name))
@@ -339,8 +369,9 @@ def fetch_branches_continuously(token, owner, repo, stale_days):
                     "Branch": name,
                     "Last Commit": commit_date.strftime("%Y-%m-%d"),
                     "Category": category,
-                    "Author": author_name,
-                    "Author Email": author_email
+                    "Updated By": updated_by,
+                    "_author_name": author_name,
+                    "_author_email": author_email
                 })
 
         page += 1
@@ -426,7 +457,7 @@ with config_col2:
     owner = st.text_input("👤 Repository Owner", value="shivanipacharne-eaton")
 
 with config_col3:
-    repo = st.text_input("📦 Repository Name", value="kafka")
+    repo = st.text_input("📦 Repository Name", value="test-repo")
 
 with config_col4:
     stale_days = st.number_input("⏰ Stale Branch Threshold (days)", min_value=1, value=90, help="Branches with no commits for this many days will be marked as stale")
@@ -551,7 +582,9 @@ while st.session_state.fetching or fetching_flag.is_set():
         # ✅ Table with filtered branches
         active_branches = [b for b in branch_details if b["Branch"] not in st.session_state.deleted_branches]
         df = pd.DataFrame(active_branches)
-        table_placeholder.dataframe(df, height=600, width='stretch')
+        # Filter out hidden columns (starting with _)
+        display_columns = [col for col in df.columns if not col.startswith('_')]
+        table_placeholder.dataframe(df[display_columns], height=600, width='stretch')
         
         # Update status when completed
         if fetch_completed.is_set():
@@ -625,7 +658,9 @@ if not st.session_state.fetching and branch_details:
             
             # Update table
             df = pd.DataFrame(active_branches)
-            table_placeholder.dataframe(df, height=600, width='stretch')
+            # Filter out hidden columns (starting with _)
+            display_columns = [col for col in df.columns if not col.startswith('_')]
+            table_placeholder.dataframe(df[display_columns], height=600, width='stretch')
             
             # Reset refresh flag after updating
             if st.session_state.refresh_graph:
@@ -781,9 +816,9 @@ if notify_btn:
     else:
         logging.info(f"Total branches to notify about: {len(branches_to_notify)}")
         
-        # Prepare notification data
-        branches_by_author = prepare_notification_data(branches_to_notify)
-        logging.info(f"Branches grouped by {len(branches_by_author)} authors")
+        # Prepare notification data grouped by Updated By
+        branches_by_updater = prepare_notification_data(branches_to_notify)
+        logging.info(f"Branches grouped by {len(branches_by_updater)} updaters")
         
         # Create GitHub issue with @mentions
         logging.info("🔔 Creating GitHub issue with @mentions")
@@ -792,14 +827,14 @@ if notify_btn:
             logging.info(f"Issue title: {issue_title}")
             
             success, message, issue_url = create_github_issue_notification(
-                github_token, owner, repo, branches_by_author, issue_title
+                github_token, owner, repo, branches_by_updater, issue_title
             )
             
             if success:
                 with notification_result_placeholder.container():
                     st.success(f"✅ {message}")
                     if issue_url:
-                        st.markdown(f"**[View Issue]({issue_url})** - Authors will be notified via GitHub")
+                        st.markdown(f"**[View Issue]({issue_url})** - Users will be notified via GitHub")
                         st.info("💡 Users mentioned with @username will receive GitHub notifications automatically")
                 logging.info(f"✅ GitHub issue created: {issue_url}")
             else:
@@ -886,6 +921,8 @@ if st.session_state.branches_to_delete and not st.session_state.fetching:
         
         # Update table immediately
         df = pd.DataFrame(active_branches)
-        table_placeholder.dataframe(df, height=600, width='stretch')
+        # Filter out hidden columns (starting with _)
+        display_columns = [col for col in df.columns if not col.startswith('_')]
+        table_placeholder.dataframe(df[display_columns], height=600, width='stretch')
 
     time.sleep(1)
