@@ -334,30 +334,39 @@ def fetch_branches_continuously(token, owner, repo, stale_days):
                                     author_name = actor_login
                                     # Use commit email (which is the actual email associated with commits)
                                     author_email = commit_data['commit']['author'].get('email', 'Unknown')
+                                    logging.info(f"Branch '{name}': Found CreateEvent - author_name='{author_name}', author_email='{author_email}'")
                                     break
                         
                         # If not found in events, fallback to commit author
                         if not author_name:
                             if commit_data.get('author') and commit_data['author'].get('login'):
                                 author_name = commit_data['author']['login']
+                                logging.info(f"Branch '{name}': No CreateEvent, using commit_data['author']['login'] - author_name='{author_name}'")
                             elif commit_data.get('committer') and commit_data['committer'].get('login'):
                                 author_name = commit_data['committer']['login']
+                                logging.info(f"Branch '{name}': No CreateEvent, using commit_data['committer']['login'] - author_name='{author_name}'")
                             else:
                                 author_name = commit_data['commit']['author'].get('name', 'Unknown')
+                                logging.info(f"Branch '{name}': No CreateEvent, using commit_data['commit']['author']['name'] - author_name='{author_name}'")
                             author_email = commit_data['commit']['author'].get('email', 'Unknown')
+                            logging.info(f"Branch '{name}': Fallback - author_email='{author_email}'")
                             
                     except Exception as e:
                         logging.warning(f"Could not fetch events for branch {name}: {e}, using commit author")
                         # Fallback to commit author
                         if commit_data.get('author') and commit_data['author'].get('login'):
                             author_name = commit_data['author']['login']
+                            logging.info(f"Branch '{name}': Exception fallback using commit_data['author']['login'] - author_name='{author_name}'")
                         else:
                             author_name = commit_data['commit']['author'].get('name', 'Unknown')
+                            logging.info(f"Branch '{name}': Exception fallback using commit_data['commit']['author']['name'] - author_name='{author_name}'")
                         author_email = commit_data['commit']['author'].get('email', 'Unknown')
+                        logging.info(f"Branch '{name}': Exception fallback - author_email='{author_email}'")
                     
                     # Updated By is the same as Author (branch creator) for consistency with GitHub
                     # GitHub's "Updated" shows who created/pushed the branch, not the commit author
                     updated_by = author_name if author_name else 'Unknown'
+                    logging.info(f"Branch '{name}': FINAL VALUES - author_name='{author_name}', author_email='{author_email}', updated_by='{updated_by}'")
                     
                 except Exception as e:
                     logging.error(f"Failed to fetch commit for branch {name}: {e}")
@@ -447,20 +456,55 @@ st.markdown('<h1 class="main-header"> GitHub Branch Management Dashboard</h1>', 
 # =============================
 st.markdown("### ⚙️ Configuration")
 
-# First row: 4 input fields
-config_col1, config_col2, config_col3, config_col4 = st.columns(4)
+# Make configuration collapsible after fetching starts
+if st.session_state.fetching or len(branch_details) > 0:
+    with st.expander("⚙️ Configuration", expanded=False):
+        # First row: 4 input fields
+        config_col1, config_col2, config_col3, config_col4 = st.columns(4)
 
-with config_col1:
-    github_token = st.text_input("🔑 GitHub Token", type="password", value="")
+        with config_col1:
+            github_token = st.text_input("🔑 GitHub Token", type="password", value="")
 
-with config_col2:
-    owner = st.text_input("👤 Repository Owner", value="shivanipacharne-eaton")
+        with config_col2:
+            owner = st.text_input("👤 Repository Owner", value="shivanipacharne-eaton")
 
-with config_col3:
-    repo = st.text_input("📦 Repository Name", value="test-repo")
+        with config_col3:
+            repo = st.text_input("📦 Repository Name", value="test-repo")
 
-with config_col4:
-    stale_days = st.number_input("⏰ Stale Branch Threshold (days)", min_value=1, value=90, help="Branches with no commits for this many days will be marked as stale")
+        with config_col4:
+            stale_days = st.number_input("⏰ Stale Branch Threshold (days)", min_value=1, value=90, help="Branches with no commits for this many days will be marked as stale")
+        
+        # Second row: Protected branches input
+        protected_branches_input = st.text_input(
+            "🛡️ Protected Branches",
+            value="main, master",
+            help="Comma-separated list of branch names to protect from deletion"
+        )
+else:
+    # First row: 4 input fields
+    config_col1, config_col2, config_col3, config_col4 = st.columns(4)
+
+    with config_col1:
+        github_token = st.text_input("🔑 GitHub Token", type="password", value="")
+
+    with config_col2:
+        owner = st.text_input("👤 Repository Owner", value="shivanipacharne-eaton")
+
+    with config_col3:
+        repo = st.text_input("📦 Repository Name", value="test-repo")
+
+    with config_col4:
+        stale_days = st.number_input("⏰ Stale Branch Threshold (days)", min_value=1, value=90, help="Branches with no commits for this many days will be marked as stale")
+    
+    # Second row: Protected branches input
+    protected_branches_input = st.text_input(
+        "🛡️ Protected Branches",
+        value="main, master",
+        help="Comma-separated list of branch names to protect from deletion"
+    )
+
+# Parse protected branches from input
+protected_branches = [branch.strip().lower() for branch in protected_branches_input.split(',') if branch.strip()]
 
 # Second row: Start/Stop buttons side by side
 btn_col1, btn_col2, btn_col3, btn_col4 = st.columns([4, 1.5, 1.5, 4])
@@ -533,6 +577,19 @@ if start_btn and github_token:
     st.session_state.fetching = True
     fetching_flag.set()
     fetch_completed.clear()  # Reset completion flag
+    
+    # Clear previous data and reset graph
+    with lock:
+        branch_details.clear()
+        branch_categories["stale"].clear()
+        branch_categories["open_pr"].clear()
+        branch_categories["closed_pr"].clear()
+        branch_categories["no_pr"].clear()
+    
+    # Clear the graph and table
+    graph_placeholder.empty()
+    table_placeholder.empty()
+    
     status_placeholder.info("Fetching branches in background...")
     threading.Thread(target=fetch_branches_continuously, args=(github_token, owner, repo, stale_days), daemon=True).start()
 
@@ -606,7 +663,6 @@ if not st.session_state.fetching and branch_details:
         no_pr_branches = [b for b in active_branches if b["Category"] == "no_pr"]
         
         # Filter out protected branches from all categories
-        protected_branches = ['main', 'master', 'develop', 'development']
         deletable_stale = [b for b in stale_branches 
                           if b["Branch"].lower() not in protected_branches]
         deletable_open_pr = [b for b in open_pr_branches 
@@ -733,7 +789,6 @@ if delete_btn:
     # Determine which branches to delete based on checkbox selections
     branches_to_queue = []
     selected_categories = []
-    protected_branches = ['main', 'master', 'develop', 'development']
     
     if st.session_state.delete_stale:
         # Filter out protected branches
@@ -877,7 +932,6 @@ if st.session_state.branches_to_delete and not st.session_state.fetching:
         active_branches = [b for b in branch_details if b["Branch"] not in st.session_state.deleted_branches]
         
         # Filter out protected branches
-        protected_branches = ['main', 'master', 'develop', 'development']
         stale_branches = [b for b in active_branches if b["Category"] == "stale"]
         open_pr_branches = [b for b in active_branches if b["Category"] == "open_pr"]
         closed_pr_branches = [b for b in active_branches if b["Category"] == "closed_pr"]
